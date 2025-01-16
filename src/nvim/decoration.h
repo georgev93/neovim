@@ -68,9 +68,11 @@ typedef union {
   int next_free_i;
 } DecorRangeSlot;
 
+typedef kvec_t(DecorRangeSlot) DecorRangeSlots;
+
 typedef struct {
   MarkTreeIter itr[1];
-  kvec_t(DecorRangeSlot) slots;
+  DecorRangeSlots slots;
   kvec_t(int) ranges_i;
   /// Indices in [0; current_end) of `ranges_i` point to ranges that start
   /// before current position. Sorted by priority and order of insertion.

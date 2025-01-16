@@ -250,6 +250,37 @@ static int line_putchar(buf_T *buf, const char **pp, schar_T *dest, int maxcells
   return cells;
 }
 
+static DecorRangeSlots get_virt_text_on_line(win_T *wp, int* totalEolRightAlignWidth)
+{
+  DecorRangeSlots retVal = { 0 };
+
+  DecorState *const state = &decor_state;
+  int *const indices = state->ranges_i.items;
+  DecorRangeSlot *const slots = state->slots.items;
+  *totalEolRightAlignWidth = -1;
+
+  // Get array of virtual text for the current line
+  for (int i = 0; i < state->current_end; i++) {
+    DecorRange *item = &slots[indices[i]].range;
+
+    if (item->start_row != state->row || !decor_virt_pos(item) || item->draw_col != -1) {
+      continue;
+    }
+
+    if (item->kind == kDecorKindVirtText) {
+      assert(item->data.vt);
+      kv_push(retVal, (DecorRangeSlot){.range = *item});
+
+      /// If this virtual text is EOL right aligned, keep track of the total width
+      if(item->data.vt->pos == kVPosEndOfLineRightAlign) {
+        *totalEolRightAlignWidth += item->data.vt->width + 1;
+      }
+    }
+  }
+
+  return retVal;
+}
+
 static void draw_virt_text(win_T *wp, buf_T *buf, int col_off, int *end_col, int win_row)
 {
   DecorState *const state = &decor_state;
@@ -257,97 +288,73 @@ static void draw_virt_text(win_T *wp, buf_T *buf, int col_off, int *end_col, int
   int right_pos = max_col;
   bool const do_eol = state->eol_col > -1;
 
-  int const end = state->current_end;
-  int *const indices = state->ranges_i.items;
-  DecorRangeSlot *const slots = state->slots.items;
-
   /// Total width of all virtual text with "eol_right_align" alignment
   int totalWidthOfEolRightAlignedVirtText = 0;
 
-  for (int i = 0; i < end; i++) {
-    DecorRange *item = &slots[indices[i]].range;
-    if (!(item->start_row == state->row && decor_virt_pos(item))) {
-      continue;
-    }
+  DecorRangeSlots virtTextOnCurrLine = get_virt_text_on_line(wp, &totalWidthOfEolRightAlignedVirtText);
 
-    DecorVirtText *vt = NULL;
-    if (item->kind == kDecorKindVirtText) {
-      assert(item->data.vt);
-      vt = item->data.vt;
-    }
-    if (decor_virt_pos(item) && item->draw_col == -1) {
-      bool updated = true;
-      VirtTextPos pos = decor_virt_pos_kind(item);
+  int eolOffset = 0;
+  if (totalWidthOfEolRightAlignedVirtText <= (right_pos - state->eol_col)) {
+    eolOffset = right_pos - totalWidthOfEolRightAlignedVirtText - state->eol_col;
+  }
 
-      if (do_eol && pos == kVPosEndOfLineRightAlign) {
-        int eolOffset = 0;
-        if (totalWidthOfEolRightAlignedVirtText == 0) {
-          // Look ahead to the remaining decor items
-          for (int j = i; j < end; j++) {
-            /// A future decor to be handled in this function's call
-            DecorRange *lookaheadItem = &slots[indices[j]].range;
+  int newCol = 0;
+  int* newColPtr = &newCol;
 
-            if (lookaheadItem->start_row != state->row
-                || !decor_virt_pos(lookaheadItem)
-                || lookaheadItem->draw_col != -1) {
-              continue;
-            }
-
-            /// The Virtual Text of the decor item we're looking ahead to
-            DecorVirtText *lookaheadVt = NULL;
-            if (item->kind == kDecorKindVirtText) {
-              assert(item->data.vt);
-              lookaheadVt = item->data.vt;
-            }
-
-            if (decor_virt_pos_kind(lookaheadItem) == kVPosEndOfLineRightAlign) {
-              // An extra space is added for single character spacing in EOL alignment
-              totalWidthOfEolRightAlignedVirtText += (lookaheadVt->width + 1);
-            }
-          }
-
-          // Remove one space from the total width since there's no single space after the last entry
-          totalWidthOfEolRightAlignedVirtText--;
-
-          if (totalWidthOfEolRightAlignedVirtText <= (right_pos - state->eol_col)) {
-            eolOffset = right_pos - totalWidthOfEolRightAlignedVirtText - state->eol_col;
-          }
+  // Determine column position of each virtual text decorator
+  for(int i = 0; i < (int)kv_size(virtTextOnCurrLine); i++) {
+    DecorRange* currVirtTextDecor = &virtTextOnCurrLine.items[i].range;
+    switch(decor_virt_pos_kind(currVirtTextDecor)) {
+      case kVPosEndOfLine:
+        if(do_eol) {
+          currVirtTextDecor->draw_col = state->eol_col++;
+          newColPtr = &state->eol_col;
+        } else if(currVirtTextDecor->draw_col < 0 || currVirtTextDecor->draw_col >= wp->w_grid.cols) {
+          currVirtTextDecor->draw_col = INT_MIN;
         }
-
-        item->draw_col = state->eol_col + eolOffset;
-      } else if (pos == kVPosRightAlign) {
-        right_pos -= vt->width;
-        item->draw_col = right_pos;
-      } else if (pos == kVPosEndOfLine && do_eol) {
-        item->draw_col = state->eol_col;
-      } else if (pos == kVPosWinCol) {
-        item->draw_col = MAX(col_off + vt->col, 0);
-      } else {
-        updated = false;
-      }
-      if (updated && (item->draw_col < 0 || item->draw_col >= wp->w_grid.cols)) {
-        // Out of window, don't draw at all.
-        item->draw_col = INT_MIN;
-      }
+        break;
+      case kVPosEndOfLineRightAlign:
+        if(do_eol) {
+          currVirtTextDecor->draw_col = state->eol_col++ + eolOffset;
+          newColPtr = &state->eol_col;
+        } else if(currVirtTextDecor->draw_col < 0 || currVirtTextDecor->draw_col >= wp->w_grid.cols) {
+          currVirtTextDecor->draw_col = INT_MIN;
+        }
+        break;
+      case kVPosRightAlign:
+        right_pos -= currVirtTextDecor->data.vt->width;
+        currVirtTextDecor->draw_col = right_pos;
+        break;
+      case kVPosWinCol:
+        currVirtTextDecor->draw_col = MAX(col_off + currVirtTextDecor->data.vt->col, 0);
+        break;
+      case kVPosInline:
+      case kVPosOverlay:
+        if(currVirtTextDecor->draw_col < 0 || currVirtTextDecor->draw_col >= wp->w_grid.cols) {
+          currVirtTextDecor->draw_col = INT_MIN;
+        }
+        break;
     }
-    if (item->draw_col < 0) {
+
+    if(currVirtTextDecor->draw_col < 0) {
       continue;
     }
+    *newColPtr = draw_virt_text_item(
+      buf, currVirtTextDecor->draw_col, currVirtTextDecor->data.vt->data.virt_text,
+      currVirtTextDecor->data.vt->hl_mode, max_col, currVirtTextDecor->draw_col - col_off);
+    *end_col = MAX(*end_col, *newColPtr);
+  }
+
+  for (int i = 0; i < state->current_end; i++) {
+    DecorRange *item = &state->slots.items[state->ranges_i.items[i]].range;
     if (item->kind == kDecorKindUIWatched) {
       // send mark position to UI
-      WinExtmark m = { (NS)item->data.ui.ns_id, item->data.ui.mark_id, win_row, item->draw_col };
+      WinExtmark m = { (NS)item->data.ui.ns_id, item->data.ui.mark_id,
+                       win_row, item->draw_col };
       kv_push(win_extmark_arr, m);
     }
-    if (vt) {
-      int vcol = item->draw_col - col_off;
-      int col = draw_virt_text_item(buf, item->draw_col, vt->data.virt_text,
-                                    vt->hl_mode, max_col, vcol);
-      if (do_eol && ((vt->pos == kVPosEndOfLine) || (vt->pos == kVPosEndOfLineRightAlign))) {
-        state->eol_col = col + 1;
-      }
-      *end_col = MAX(*end_col, col);
-    }
-    if (!vt || !(vt->flags & kVTRepeatLinebreak)) {
+
+    if ((item->kind != kDecorKindVirtText) || !(item->data.vt->flags & kVTRepeatLinebreak)) {
       item->draw_col = INT_MIN;  // deactivate
     }
   }
